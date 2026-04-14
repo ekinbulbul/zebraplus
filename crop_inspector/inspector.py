@@ -1,32 +1,24 @@
 """
 inspector.py
 -------------
-Paylaşılan tek bir backbone (FeatureExtractor) üzerinde
-10 bağımsız GaussianModel çalıştırır.
+Paylaşılan tek backbone (FeatureExtractor) üzerinde
+200 bağımsız GaussianModel çalıştırır.
 
-Bellek düzeni:
-    - FeatureExtractor : 1×  (ResNet18 early layers, ~11 MB)
-    - GaussianModel    : 10× (her biri kendi .npz ağırlığıyla)
+Yönlendirme : crop_id % NUM_MODELS → gaussian[i]
 
-Yönlendirme:
-    crop_id % 10  →  gaussian[i]
-
-Ağırlık klasörü beklentisi:
+Ağırlık klasörü:
     weights/
         model_0/gaussian_model.npz
-        model_1/gaussian_model.npz
+        model_0/meta.txt
         ...
         model_9/gaussian_model.npz
-
-Kullanım:
-    inspector = CropInspector(weights_dir="weights/", device="cpu")
-    result = inspector.inspect(crop_id=7, image_path="crop_007.png")
-    # {"crop_id": 7, "model_idx": 7, "score": 2.34, "label": "NORMAL", "heatmap": ...}
+        model_9/meta.txt
 """
 
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 import numpy as np
 import cv2
 from pathlib import Path
@@ -38,30 +30,45 @@ from core.transforms         import build_transform, load_batch, normalize_heatm
 NUM_MODELS = 10
 
 
+def _load_meta(model_dir: Path) -> dict:
+    """meta.txt varsa okur, yoksa varsayılan döner."""
+    meta_path = model_dir / "meta.txt"
+    meta = {"pool": 1, "img_size": (1200, 1200)}
+    if meta_path.exists():
+        for line in meta_path.read_text(encoding="utf-8").splitlines():
+            if "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            if k == "pool":
+                meta["pool"] = int(v)
+            elif k == "img_size":
+                h, w = v.split(",")
+                meta["img_size"] = (int(h), int(w))
+    return meta
+
+
 class CropInspector:
     """
-    Tek backbone + 10 bağımsız GaussianModel.
+    Tek backbone + NUM_MODELS bağımsız GaussianModel.
 
     Args:
         weights_dir : weights/ klasörü; altında model_0/ ... model_9/ beklenir
-        img_size    : (H, W) görüntü boyutu
+        img_size    : (H, W) — inference görüntü boyutu
         device      : "cuda" | "cpu" | None (otomatik)
-        pretrained  : backbone ImageNet ağırlıkları (önerilir)
+        pretrained  : backbone ImageNet ağırlıkları
     """
 
     def __init__(
         self,
         weights_dir: str,
-        img_size: tuple[int, int] = (256, 256),
+        img_size: tuple[int, int] = (1200, 1200),
         device: str | None = None,
         pretrained: bool = True,
-        half: bool = False,
     ):
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
         self.device    = torch.device(device)
         self.img_size  = img_size
-        self.half      = half
         self.transform = build_transform(img_size)
 
         # ── Paylaşılan backbone (1×) ─────────────────────────────────
@@ -69,39 +76,61 @@ class CropInspector:
         self.backbone = FeatureExtractor(pretrained=pretrained, freeze=True).to(self.device)
         self.backbone.eval()
 
-        # ── 10 bağımsız GaussianModel ────────────────────────────────
-        print(f"[CropInspector] {NUM_MODELS} GaussianModel yükleniyor...")
+        # ── NUM_MODELS bağımsız GaussianModel (CPU RAM'de bekler) ────
+        print(f"[CropInspector] {NUM_MODELS} GaussianModel yükleniyor (CPU)...")
         self.gaussians: list[GaussianModel] = []
-        dtype_str = "float16" if half else "float32"
+        self.pools: list[int] = []
+
         for i in range(NUM_MODELS):
-            g = GaussianModel(device=self.device)
-            model_path = str(Path(weights_dir) / f"model_{i}" / "gaussian_model")
-            g.load(model_path, half=half)
+            model_dir  = Path(weights_dir) / f"model_{i}"
+            meta       = _load_meta(model_dir)
+            pool       = meta["pool"]
+
+            # Gaussian CPU'da yüklenir — Mahalanobis anında GPU'ya taşınır
+            g = GaussianModel(device="cpu")
+            g.load(str(model_dir / "gaussian_model"))
             self.gaussians.append(g)
-            print(f"  gaussian[{i}] ← {model_path}.npz  [{dtype_str}]")
+            self.pools.append(pool)
+            print(f"  gaussian[{i}] pool=x{pool} ← {model_dir}")
 
         print("[CropInspector] Hazır.")
 
     # ── İç yardımcılar ───────────────────────────────────────────────
 
     def _route(self, crop_id: int) -> int:
-        """crop_id % 10 → gaussian index."""
-        return crop_id % 10
+        return crop_id % NUM_MODELS
 
     @torch.no_grad()
     def _extract(self, image_path: str) -> torch.Tensor:
-        """Görüntüyü yükler, backbone'dan feature map çıkarır."""
+        """Backbone forward — sonuç GPU'da kalır."""
         tensor = load_batch([image_path], self.transform).to(self.device)
-        return self.backbone(tensor)           # (1, 192, H/4, W/4)
+        return self.backbone(tensor)      # (1, 192, H/4, W/4)
 
     def _score(self, features: torch.Tensor, model_idx: int) -> tuple[np.ndarray, float]:
-        """Feature map'i ilgili Gaussian'a gönderir, heatmap + skor döner."""
-        dist_map = self.gaussians[model_idx].mahalanobis_map(features)[0]  # (h, w)
-        dist_np  = dist_map.float().cpu().numpy()
-        H, W     = self.img_size
-        resized  = cv2.resize(dist_np, (W, H), interpolation=cv2.INTER_LINEAR)
-        score    = float(resized.mean())
-        heatmap  = normalize_heatmap(resized)
+        """
+        Precision'ı CPU'dan GPU'ya taşı → Mahalanobis hesapla → CPU'ya geri al.
+        features: GPU tensor (1, 192, feat_h, feat_w)
+        """
+        pool = self.pools[model_idx]
+        g    = self.gaussians[model_idx]
+
+        # Feature'ı pool et (backbone çıktısı tam çözünürlükte kalır)
+        if pool > 1:
+            feats_pooled = F.avg_pool2d(features, kernel_size=pool, stride=pool)
+        else:
+            feats_pooled = features
+
+        # Precision'ı GPU'ya taşı (geçici)
+        g.to(self.device)
+        dist_map = g.mahalanobis_map(feats_pooled)[0]   # (h, w) GPU
+        dist_np  = dist_map.cpu().numpy()
+        # Precision'ı tekrar CPU'ya al (VRAM serbest kalır)
+        g.to("cpu")
+
+        H, W    = self.img_size
+        resized = cv2.resize(dist_np, (W, H), interpolation=cv2.INTER_LINEAR)
+        score   = float(resized.mean())
+        heatmap = normalize_heatmap(resized)
         return heatmap, score
 
     # ── Dışa açık API ────────────────────────────────────────────────
@@ -112,18 +141,6 @@ class CropInspector:
         image_path: str,
         threshold: float | None = None,
     ) -> dict:
-        """
-        Tek bir crop'u analiz eder.
-
-        Returns:
-            {
-                "crop_id"   : int,
-                "model_idx" : int,
-                "score"     : float,
-                "label"     : "DEFECT" | "NORMAL" | "UNKNOWN",
-                "heatmap"   : np.ndarray  (H, W) float32 [0,1]
-            }
-        """
         model_idx      = self._route(crop_id)
         features       = self._extract(image_path)
         heatmap, score = self._score(features, model_idx)
@@ -145,10 +162,6 @@ class CropInspector:
         crops: list[tuple[int, str]],
         threshold: float | None = None,
     ) -> list[dict]:
-        """
-        [(crop_id, image_path), ...] listesini sırayla işler.
-        Backbone her crop için bir kez çalışır.
-        """
         results = []
         for crop_id, image_path in crops:
             results.append(self.inspect(crop_id, image_path, threshold))
