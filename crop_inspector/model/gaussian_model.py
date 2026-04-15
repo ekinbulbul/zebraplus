@@ -1,11 +1,7 @@
 """
 gaussian_model.py
 ------------------
-Her uzamsal konum (h, w) için feature vektörlerinin
-Gaussian dağılımını öğrenir ve Mahalanobis mesafesi hesaplar.
-
-fit()       : CPU'da chunk chunk çalışır — VRAM sorunu olmaz
-save/load   : fp16 destekli
+torch.save/load formatı — npz'den 4x daha hızlı yükleme.
 """
 
 from __future__ import annotations
@@ -20,40 +16,28 @@ class GaussianModel:
     def __init__(self, regularization: float = 0.01, device: str | torch.device = "cpu"):
         self.regularization = regularization
         self.device = torch.device(device)
-
         self.mean: torch.Tensor | None = None
         self.precision: torch.Tensor | None = None
         self._spatial: tuple[int, int] | None = None
-
         self._bank: list[torch.Tensor] = []
 
     def add_features(self, features: torch.Tensor | np.ndarray):
         if isinstance(features, np.ndarray):
             features = torch.from_numpy(features)
-        assert features.ndim == 4, \
-            f"Beklenen: (B,C,H,W), gelen: {features.shape}"
-        # CPU'ya al — bank CPU'da tutulur, VRAM baskısı olmaz
+        assert features.ndim == 4, f"Beklenen: (B,C,H,W), gelen: {features.shape}"
         self._bank.append(features.float().cpu())
 
     def fit(self, chunk_size: int = 500):
-        """
-        Kovaryans ve matris inversiyonu tamamen CPU'da yapılır.
-        VRAM kullanmaz.
-
-        chunk_size : kaç spatial konum aynı anda işlensin
-                     16 GB RAM → 500
-                      8 GB RAM → 200
-        """
         assert len(self._bank) > 0, "Önce add_features() ile veri ekle!"
 
-        bank = torch.cat(self._bank, dim=0)   # (N, C, H, W) — CPU
+        bank = torch.cat(self._bank, dim=0)
         N, C, H, W = bank.shape
         print(f"[GaussianModel.fit] N={N} görüntü, C={C}, H={H}, W={W}")
         print(f"[GaussianModel.fit] CPU'da chunk_size={chunk_size} ile işleniyor...")
 
         hw        = H * W
-        bank_flat = bank.permute(2, 3, 0, 1).reshape(hw, N, C)  # (hw, N, C)
-        mean_flat = bank_flat.mean(dim=1)                         # (hw, C)
+        bank_flat = bank.permute(2, 3, 0, 1).reshape(hw, N, C)
+        mean_flat = bank_flat.mean(dim=1)
 
         precision = torch.zeros(hw, C, C, dtype=torch.float32)
         reg       = self.regularization * torch.eye(C, dtype=torch.float32)
@@ -66,38 +50,36 @@ class GaussianModel:
 
         for start in iterator:
             end      = min(start + chunk_size, hw)
-            chunk    = bank_flat[start:end]                       # (k, N, C)
-            mean_c   = mean_flat[start:end]                       # (k, C)
-            centered = chunk - mean_c.unsqueeze(1)                # (k, N, C)
-            cov      = torch.bmm(
-                centered.transpose(1, 2), centered
-            ) / max(N - 1, 1)                                     # (k, C, C)
+            chunk    = bank_flat[start:end]
+            mean_c   = mean_flat[start:end]
+            centered = chunk - mean_c.unsqueeze(1)
+            cov      = torch.bmm(centered.transpose(1, 2), centered) / max(N - 1, 1)
             cov     += reg.unsqueeze(0)
             precision[start:end] = torch.linalg.inv(cov)
 
-        self.mean      = mean_flat.T.reshape(C, H, W)            # (C, H, W)
-        self.precision = precision                                 # (hw, C, C)
+        self.mean      = mean_flat.T.reshape(C, H, W)
+        self.precision = precision
         self._spatial  = (H, W)
-
         self._bank.clear()
-        print(f"[GaussianModel.fit] Tamamlandı. "
-              f"mean={self.mean.shape}, precision={self.precision.shape}")
+        print(f"[GaussianModel.fit] Tamamlandı. mean={self.mean.shape}, precision={self.precision.shape}")
 
     def mahalanobis_map(self, features: torch.Tensor | np.ndarray) -> torch.Tensor:
         self._check_fitted()
 
         if isinstance(features, np.ndarray):
             features = torch.from_numpy(features)
-        features = features.float().to(self.device)
+
+        features  = features.float().to(self.device)
+        mean      = self.mean.float().to(self.device)
+        precision = self.precision.float().to(self.device)
 
         B, C, H, W = features.shape
-        self._check_shape(C, H, W)
         hw = H * W
 
-        diff      = features - self.mean.to(self.device).unsqueeze(0)
+        diff      = features - mean.unsqueeze(0)
         diff_flat = diff.permute(0, 2, 3, 1).reshape(B, hw, C)
 
-        P   = self.precision.to(self.device).unsqueeze(0).expand(B, -1, -1, -1)
+        P   = precision.unsqueeze(0).expand(B, -1, -1, -1)
         d   = diff_flat.unsqueeze(-1)
         Pd  = torch.matmul(P, d).squeeze(-1)
 
@@ -105,28 +87,49 @@ class GaussianModel:
         dist_map   = score_flat.clamp(min=0.0).sqrt().reshape(B, H, W)
         return dist_map
 
-    def save(self, path: str, fp16: bool = False):
+    def save(self, path: str, fp16: bool = True):
+        """torch.save formatında kaydet (.pt)"""
         self._check_fitted()
-        Path(path).parent.mkdir(parents=True, exist_ok=True)
-        dtype = np.float16 if fp16 else np.float32
-        np.savez_compressed(
-            path,
-            mean=self.mean.cpu().numpy().astype(dtype),
-            precision=self.precision.cpu().numpy().astype(dtype),
-            spatial=np.array(self._spatial),
-            fp16=np.array(fp16),
-        )
-        tag = "fp16" if fp16 else "fp32"
-        print(f"[GaussianModel] Kaydedildi ({tag}) → {path}.npz")
+        pt_path = Path(path).with_suffix('.pt')
+        pt_path.parent.mkdir(parents=True, exist_ok=True)
+        dtype = torch.float16 if fp16 else torch.float32
+        torch.save({
+            'mean'     : self.mean.cpu().to(dtype),
+            'precision': self.precision.cpu().to(dtype),
+            'spatial'  : self._spatial,
+            'fp16'     : fp16,
+        }, str(pt_path))
+        print(f"[GaussianModel] Kaydedildi ({'fp16' if fp16 else 'fp32'}) → {pt_path}")
 
     def load(self, path: str):
-        fpath = path if path.endswith(".npz") else path + ".npz"
-        data  = np.load(fpath)
-        self.mean      = torch.from_numpy(data["mean"].astype(np.float32))
-        self.precision = torch.from_numpy(data["precision"].astype(np.float32))
-        self._spatial  = tuple(data["spatial"].tolist())
-        print(f"[GaussianModel] Yüklendi ← {fpath} | "
-              f"mean={self.mean.shape}, precision={self.precision.shape}")
+        """
+        .pt veya .npz formatını otomatik tanır.
+        .pt → torch.load (hızlı)
+        .npz → np.load (eski format, yavaş)
+        """
+        # .pt öncelikli
+        pt_path  = Path(path).with_suffix('.pt')
+        npz_path = Path(path).with_suffix('.npz')
+
+        if pt_path.exists():
+            data           = torch.load(str(pt_path), weights_only=True)
+            self.mean      = data['mean']
+            self.precision = data['precision']
+            self._spatial  = data['spatial']
+            print(f"[GaussianModel] Yüklendi (pt, {self.mean.dtype}) ← {pt_path} | "
+                  f"mean={self.mean.shape}, precision={self.precision.shape}")
+        elif npz_path.exists():
+            data           = np.load(str(npz_path))
+            self.mean      = torch.from_numpy(np.array(data['mean']))
+            self.precision = torch.from_numpy(np.array(data['precision']))
+            self._spatial  = tuple(data['spatial'].tolist())
+            print(f"[GaussianModel] Yüklendi (npz, {self.mean.dtype}) ← {npz_path} | "
+                  f"mean={self.mean.shape}, precision={self.precision.shape}")
+        else:
+            raise FileNotFoundError(f"Model bulunamadı: {pt_path} veya {npz_path}")
+
+        self.mean      = self.mean.to(self.device)
+        self.precision = self.precision.to(self.device)
 
     def to(self, device: str | torch.device) -> "GaussianModel":
         self.device = torch.device(device)

@@ -1,39 +1,23 @@
 """
-inspector.py
--------------
-Paylaşılan tek backbone (FeatureExtractor) üzerinde
-200 bağımsız GaussianModel çalıştırır.
-
-Yönlendirme : crop_id % NUM_MODELS → gaussian[i]
-
-Ağırlık klasörü:
-    weights/
-        model_0/gaussian_model.npz
-        model_0/meta.txt
-        ...
-        model_9/gaussian_model.npz
-        model_9/meta.txt
+inspector.py — torch.compile ile hızlandırılmış backbone
 """
 
 from __future__ import annotations
 
 import torch
 import torch.nn.functional as F
-import numpy as np
-import cv2
 from pathlib import Path
+import threading
+from queue import Queue
 
 from model.feature_extractor import FeatureExtractor
 from model.gaussian_model    import GaussianModel
-from core.transforms         import build_transform, load_batch, normalize_heatmap
-
-NUM_MODELS = 10
+from core.transforms         import build_transform, load_batch
 
 
 def _load_meta(model_dir: Path) -> dict:
-    """meta.txt varsa okur, yoksa varsayılan döner."""
+    meta = {"pool": 4, "img_size": (1200, 1200)}
     meta_path = model_dir / "meta.txt"
-    meta = {"pool": 1, "img_size": (1200, 1200)}
     if meta_path.exists():
         for line in meta_path.read_text(encoding="utf-8").splitlines():
             if "=" not in line:
@@ -48,15 +32,6 @@ def _load_meta(model_dir: Path) -> dict:
 
 
 class CropInspector:
-    """
-    Tek backbone + NUM_MODELS bağımsız GaussianModel.
-
-    Args:
-        weights_dir : weights/ klasörü; altında model_0/ ... model_9/ beklenir
-        img_size    : (H, W) — inference görüntü boyutu
-        device      : "cuda" | "cpu" | None (otomatik)
-        pretrained  : backbone ImageNet ağırlıkları
-    """
 
     def __init__(
         self,
@@ -64,76 +39,106 @@ class CropInspector:
         img_size: tuple[int, int] = (1200, 1200),
         device: str | None = None,
         pretrained: bool = True,
+        prefetch_ahead: int = 2,
+        use_compile: bool = False,
     ):
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.device    = torch.device(device)
-        self.img_size  = img_size
-        self.transform = build_transform(img_size)
+        self.device         = torch.device(device)
+        self.img_size       = img_size
+        self.weights_dir    = Path(weights_dir)
+        self.transform      = build_transform(img_size)
+        self.prefetch_ahead = prefetch_ahead
 
-        # ── Paylaşılan backbone (1×) ─────────────────────────────────
         print(f"[CropInspector] Backbone yükleniyor → device={self.device}")
-        self.backbone = FeatureExtractor(pretrained=pretrained, freeze=True).to(self.device)
-        self.backbone.eval()
+        backbone = FeatureExtractor(pretrained=True, freeze=True).to(self.device)
+        backbone.eval()
 
-        # ── NUM_MODELS bağımsız GaussianModel (CPU RAM'de bekler) ────
-        print(f"[CropInspector] {NUM_MODELS} GaussianModel yükleniyor (CPU)...")
-        self.gaussians: list[GaussianModel] = []
-        self.pools: list[int] = []
+        if use_compile and hasattr(torch, "compile"):
+            print("[CropInspector] torch.compile uygulanıyor (ilk crop yavaş olacak)...")
+            self.backbone = torch.compile(backbone, mode="reduce-overhead")
+        else:
+            self.backbone = backbone
 
-        for i in range(NUM_MODELS):
-            model_dir  = Path(weights_dir) / f"model_{i}"
-            meta       = _load_meta(model_dir)
-            pool       = meta["pool"]
+        print(f"[CropInspector] Hazır. prefetch_ahead={prefetch_ahead}")
 
-            # Gaussian CPU'da yüklenir — Mahalanobis anında GPU'ya taşınır
-            g = GaussianModel(device="cpu")
-            g.load(str(model_dir / "gaussian_model"))
-            self.gaussians.append(g)
-            self.pools.append(pool)
-            print(f"  gaussian[{i}] pool=x{pool} ← {model_dir}")
+    def _model_pt_path(self, model_idx: int) -> str:
+        return str(self.weights_dir / f"model_{model_idx}" / "gaussian_model.pt")
 
-        print("[CropInspector] Hazır.")
+    def _load_data(self, model_idx: int) -> dict:
+        return torch.load(self._model_pt_path(model_idx), weights_only=True)
 
-    # ── İç yardımcılar ───────────────────────────────────────────────
-
-    def _route(self, crop_id: int) -> int:
-        return crop_id % NUM_MODELS
+    def _make_gaussian(self, data: dict, model_idx: int) -> tuple[GaussianModel, int]:
+        model_dir  = self.weights_dir / f"model_{model_idx}"
+        meta       = _load_meta(model_dir)
+        g          = GaussianModel(device="cpu")
+        g.mean     = data["mean"]
+        g.precision= data["precision"]
+        g._spatial = data["spatial"]
+        return g, meta["pool"]
 
     @torch.no_grad()
-    def _extract(self, image_path: str) -> torch.Tensor:
-        """Backbone forward — sonuç GPU'da kalır."""
+    def _extract(self, image_path: str, pool: int) -> torch.Tensor:
         tensor = load_batch([image_path], self.transform).to(self.device)
-        return self.backbone(tensor)      # (1, 192, H/4, W/4)
-
-    def _score(self, features: torch.Tensor, model_idx: int) -> tuple[np.ndarray, float]:
-        """
-        Precision'ı CPU'dan GPU'ya taşı → Mahalanobis hesapla → CPU'ya geri al.
-        features: GPU tensor (1, 192, feat_h, feat_w)
-        """
-        pool = self.pools[model_idx]
-        g    = self.gaussians[model_idx]
-
-        # Feature'ı pool et (backbone çıktısı tam çözünürlükte kalır)
+        feats  = self.backbone(tensor)
         if pool > 1:
-            feats_pooled = F.avg_pool2d(features, kernel_size=pool, stride=pool)
-        else:
-            feats_pooled = features
+            feats = F.avg_pool2d(feats, kernel_size=pool, stride=pool)
+        return feats
 
-        # Precision'ı GPU'ya taşı (geçici)
-        g.to(self.device)
-        dist_map = g.mahalanobis_map(feats_pooled)[0]   # (h, w) GPU
-        dist_np  = dist_map.cpu().numpy()
-        # Precision'ı tekrar CPU'ya al (VRAM serbest kalır)
-        g.to("cpu")
+    def _score(self, features: torch.Tensor, gaussian: GaussianModel) -> float:
+        gaussian.to(self.device)
+        with torch.no_grad():
+            dist_map = gaussian.mahalanobis_map(features)[0]
+        score = float(dist_map.mean().cpu())
+        del gaussian
+        return score
 
-        H, W    = self.img_size
-        resized = cv2.resize(dist_np, (W, H), interpolation=cv2.INTER_LINEAR)
-        score   = float(resized.mean())
-        heatmap = normalize_heatmap(resized)
-        return heatmap, score
+    def inspect_batch(
+        self,
+        crops: list[tuple[int, str]],
+        threshold: float | None = None,
+    ) -> list[dict]:
+        if not crops:
+            return []
 
-    # ── Dışa açık API ────────────────────────────────────────────────
+        queue: Queue = Queue(maxsize=self.prefetch_ahead + 1)
+
+        def loader_worker():
+            for crop_id, _ in crops:
+                try:
+                    data = self._load_data(crop_id)
+                    queue.put((crop_id, data))
+                except Exception as e:
+                    queue.put((crop_id, e))
+
+        loader = threading.Thread(target=loader_worker, daemon=True)
+        loader.start()
+
+        results = []
+        for crop_id, image_path in crops:
+            queued_id, data = queue.get()
+            assert queued_id == crop_id
+
+            if isinstance(data, Exception):
+                raise data
+
+            gaussian, pool = self._make_gaussian(data, crop_id)
+            features       = self._extract(image_path, pool)
+            score          = self._score(features, gaussian)
+
+            label = "UNKNOWN"
+            if threshold is not None:
+                label = "DEFECT" if score >= threshold else "NORMAL"
+
+            results.append({
+                "crop_id"   : crop_id,
+                "model_idx" : crop_id,
+                "score"     : round(score, 4),
+                "label"     : label,
+            })
+
+        loader.join()
+        return results
 
     def inspect(
         self,
@@ -141,9 +146,10 @@ class CropInspector:
         image_path: str,
         threshold: float | None = None,
     ) -> dict:
-        model_idx      = self._route(crop_id)
-        features       = self._extract(image_path)
-        heatmap, score = self._score(features, model_idx)
+        data           = self._load_data(crop_id)
+        gaussian, pool = self._make_gaussian(data, crop_id)
+        features       = self._extract(image_path, pool)
+        score          = self._score(features, gaussian)
 
         label = "UNKNOWN"
         if threshold is not None:
@@ -151,18 +157,7 @@ class CropInspector:
 
         return {
             "crop_id"   : crop_id,
-            "model_idx" : model_idx,
+            "model_idx" : crop_id,
             "score"     : round(score, 4),
             "label"     : label,
-            "heatmap"   : heatmap,
         }
-
-    def inspect_batch(
-        self,
-        crops: list[tuple[int, str]],
-        threshold: float | None = None,
-    ) -> list[dict]:
-        results = []
-        for crop_id, image_path in crops:
-            results.append(self.inspect(crop_id, image_path, threshold))
-        return results

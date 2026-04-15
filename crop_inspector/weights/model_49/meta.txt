@@ -1,0 +1,4 @@
+pool=4
+img_size=1200,1200
+n_train=1000
+feat_spatial=75,75
