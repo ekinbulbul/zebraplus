@@ -47,8 +47,8 @@ def main():
     save_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"[run] {len(image_paths)} görüntü bulundu.")
-    if len(image_paths) > 200:
-        image_paths = image_paths[:200]
+    if len(image_paths) > 300:
+        image_paths = image_paths[:300]
 
     inspector = CropInspector(
         weights_dir=args.weights,

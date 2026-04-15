@@ -1,0 +1,4 @@
+pool=8
+img_size=600,600
+n_train=1000
+feat_spatial=18,18
